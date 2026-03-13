@@ -1,1 +1,1 @@
-json(concat('{"fx":{"mep":',string(body('Get_FX')?['value'][0]?['columna 2']),',"cable":',string(body('Get_FX')?['value'][1]?['columna 2'])},"local":',string(body('List_rows_present_in_a_table')?['value']),',"ny":',string(body('List_rows_present_in_a_table_1')?['value']),'}'))
+{"fx":{"mep":1411.07107762856,"cable":1455.15960141868}}
