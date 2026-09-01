@@ -530,6 +530,8 @@
   </div>
 </div>
 
+<div id="staleness-banner" style="display:none;padding:8px 24px;font-family:'IBM Plex Mono',monospace;font-size:12px;text-align:center;font-weight:600;"></div>
+
 <div class="stats-bar">
   <div class="stat-item">
     <div class="stat-label">MEP</div>
@@ -582,6 +584,7 @@
       <option value="cupon">Ordenar: Cupón</option>
     </select>
     <button class="filter-btn" onclick="exportCSV()" style="margin-left:auto;border-color:#00d4aa44;color:#00d4aa;white-space:nowrap;">↓ Exportar Excel</button>
+    <button class="filter-btn" onclick="exportRealCSV()" style="border-color:#4d9fff44;color:#4d9fff;white-space:nowrap;">↓ Exportar CSV</button>
   </div>
 
   <div class="tab-bar" id="inner-tab-bar">
@@ -915,6 +918,11 @@ select.calc-input{cursor:pointer;}
     <div class="modal-grid" id="m-grid-market"></div>
     <div class="modal-section-title">Características</div>
     <div class="modal-grid" id="m-grid-char"></div>
+    <div class="modal-section-title">Evolución Histórica (TIR)</div>
+    <div style="height:140px;position:relative;">
+      <canvas id="m-hist-chart"></canvas>
+    </div>
+    <div id="m-hist-status" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
   </div>
 </div>
 
@@ -961,6 +969,43 @@ function mapRow(r, src) {
 
 let ALL = [];
 let lastUpdated = null;
+let dataGeneratedAt = null;
+
+// ── AVISO DE DATO DESACTUALIZADO ────────────────────────────────────
+// generated_at viene del script que sincroniza el Excel con GitHub y se
+// actualiza en cada corrida exitosa. Si pasa mucho tiempo sin cambiar,
+// probablemente el proceso automático (tarea programada) dejó de correr.
+function updateFreshness(generatedAtIso) {
+  const el = document.getElementById('last-updated');
+  const banner = document.getElementById('staleness-banner');
+  dataGeneratedAt = generatedAtIso ? new Date(generatedAtIso) : null;
+
+  if (!dataGeneratedAt || isNaN(dataGeneratedAt.getTime())) {
+    if (el) el.textContent = lastUpdated ? '↻ ' + lastUpdated.toLocaleTimeString('es-AR') : 'cargando datos...';
+    if (banner) banner.style.display = 'none';
+    return;
+  }
+
+  const ageMin = (Date.now() - dataGeneratedAt.getTime()) / 60000;
+  const genTime = dataGeneratedAt.toLocaleTimeString('es-AR');
+  const ageTxt = ageMin < 1 ? 'recién' : 'hace ' + Math.round(ageMin) + ' min';
+  if (el) el.textContent = '↻ dato generado ' + genTime + ' (' + ageTxt + ')';
+
+  if (!banner) return;
+  if (ageMin > 90) {
+    banner.style.display = 'block';
+    banner.style.background = 'rgba(255,77,109,.15)';
+    banner.style.color = '#ff4d6d';
+    banner.textContent = '⚠ Los datos no se actualizan hace ' + (ageMin/60).toFixed(1) + ' hs — el proceso automático puede haberse detenido.';
+  } else if (ageMin > 20) {
+    banner.style.display = 'block';
+    banner.style.background = 'rgba(240,180,41,.15)';
+    banner.style.color = '#f0b429';
+    banner.textContent = '⚠ Último dato de hace ' + Math.round(ageMin) + ' min.';
+  } else {
+    banner.style.display = 'none';
+  }
+}
 
 async function loadData() {
   try {
@@ -982,14 +1027,17 @@ async function loadData() {
       if (cableEl) cableEl.textContent = '$' + Number(json.fx.cable).toLocaleString('es-AR', {minimumFractionDigits:2, maximumFractionDigits:2});
     }
 
-    const el = document.getElementById('last-updated');
-    if (el) el.textContent = '↻ ' + lastUpdated.toLocaleTimeString('es-AR');
-
+    updateFreshness(json.generated_at || null);
     render();
   } catch(e) {
     console.warn('Error cargando datos en vivo:', e);
-    const el = document.getElementById('last-updated');
-    if (el) el.textContent = '⚠ Sin conexión';
+    if (dataGeneratedAt) {
+      // Reevalúa la antigüedad del último dato bueno conocido, aunque el fetch haya fallado
+      updateFreshness(dataGeneratedAt.toISOString());
+    } else {
+      const el = document.getElementById('last-updated');
+      if (el) el.textContent = '⚠ Sin conexión';
+    }
   }
 }
 
@@ -1494,6 +1542,7 @@ function openModal(ticker) {
     <div class="modal-field"><label>Segmento</label><div class="val">${d.segmento||'—'}</div></div>
   `;
   document.getElementById('modal-overlay').classList.add('open');
+  drawTickerHistoryChart(d.ticker);
 }
 function closeModal(e) {
   if(!e||e.target===document.getElementById('modal-overlay')||e.target.classList.contains('modal-close')) {
@@ -1645,6 +1694,48 @@ function exportCSV() {
   if (typeof XLSX !== 'undefined') { script.onload(); } else { document.head.appendChild(script); }
 }
 
+// Exportación CSV real (texto plano), a diferencia de exportCSV() que arma un .xlsx
+function exportRealCSV() {
+  const data = getSorted(getFiltered());
+  const headers = ['Segmento','Empresa','Ticker','Vto','Cupon','Precio','TIR','Duration','MDuration','Paridad','Paga','Ley','Rating','Monto Emitido','Vol Total','Amortizacion','CALL'];
+
+  function csvEscape(v) {
+    const s = (v===null||v===undefined) ? '' : String(v);
+    return /[",;\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+  }
+
+  const rows = data.map(r => [
+    r.segmento||'',
+    r.empresa||'',
+    r.ticker||'',
+    fmtDate(r.vto),
+    r.cupon==='Step Up' ? 'Step Up' : fmtPct(r.cupon),
+    r.px ? fmtNum(r.px*100,2) : '',
+    (r.tir!=null && !isNaN(r.tir)) ? fmtPct(r.tir) : '',
+    fmtNum(r.duration,4),
+    fmtNum(r.mduration,4),
+    r.paridad ? fmtNum(r.paridad*100,2) : '',
+    r.paga||'',
+    r.ley||'',
+    r.calificacion||'',
+    r.monto_emitido!=null ? r.monto_emitido : '',
+    r.vol_total!=null ? r.vol_total : '',
+    r.amortizacion||'',
+    r.call||''
+  ]);
+
+  const csvContent = '﻿' + [headers, ...rows].map(row => row.map(csvEscape).join(',')).join('\r\n');
+  const blob = new Blob([csvContent], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'ONs_' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // ── HISTORIAL ─────────────────────────────────────────────────────────
 const HIST_COLORS = ['#00d4aa','#4d9fff','#f7c948','#f06292'];
 const GITHUB_HISTORY_BASE = 'https://raw.githubusercontent.com/jmountfordcma-ui/onshd/main/history/';
@@ -1671,37 +1762,52 @@ function initHistorial() {
   loadHistorialDates();
 }
 
-async function loadHistorialDates() {
-  const status = document.getElementById('hist-status');
-  status.textContent = 'Cargando historial...';
+// Carga y cachea todos los archivos de history/ una sola vez por sesión de
+// página. La usan tanto la pestaña Historial como el gráfico del modal de
+// cada ON, para no pegarle dos veces a la API de GitHub.
+let histDataLoadPromise = null;
+async function ensureHistDataLoaded() {
+  if (Object.keys(histData).length > 0) return histData;
+  if (histDataLoadPromise) return histDataLoadPromise;
 
-  // Load Chart.js if not available
-  if (typeof Chart === 'undefined') {
-    await new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
-      s.onload = resolve;
-      s.onerror = reject;
-      document.head.appendChild(s);
-    });
-  }
-
-  try {
-    // Fetch the GitHub API to list files in /history
+  histDataLoadPromise = (async () => {
+    if (typeof Chart === 'undefined') {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
     const res = await fetch('https://api.github.com/repos/jmountfordcma-ui/onshd/contents/history');
     if (!res.ok) throw new Error('No se encontró carpeta history');
     const files = await res.json();
     const jsonFiles = files.filter(f => f.name.endsWith('.json')).map(f => f.name.replace('.json',''));
     jsonFiles.sort();
-    status.textContent = jsonFiles.length + ' día(s) de historial disponibles (' + (jsonFiles[0]||'') + ' → ' + (jsonFiles[jsonFiles.length-1]||'') + ')';
-    // Preload all history files
-    histData = {};
     await Promise.all(jsonFiles.map(async date => {
       try {
         const r = await fetch(GITHUB_HISTORY_BASE + date + '.json');
         if (r.ok) histData[date] = await r.json();
       } catch(e) {}
     }));
+    return histData;
+  })();
+
+  try {
+    return await histDataLoadPromise;
+  } finally {
+    histDataLoadPromise = null;
+  }
+}
+
+async function loadHistorialDates() {
+  const status = document.getElementById('hist-status');
+  status.textContent = 'Cargando historial...';
+  try {
+    await ensureHistDataLoaded();
+    const dates = Object.keys(histData).sort();
+    status.textContent = dates.length + ' día(s) de historial disponibles (' + (dates[0]||'') + ' → ' + (dates[dates.length-1]||'') + ')';
     drawHistorial();
   } catch(e) {
     status.textContent = 'Sin historial disponible todavía — se acumulará desde hoy a las 16hs.';
@@ -1778,6 +1884,70 @@ function drawHistorial() {
       }
     }
   });
+}
+
+// Gráfico histórico de TIR de una ON puntual, mostrado dentro del modal de detalle
+let mTickerChart = null;
+async function drawTickerHistoryChart(ticker) {
+  const statusEl = document.getElementById('m-hist-status');
+  const canvas = document.getElementById('m-hist-chart');
+  if (mTickerChart) { mTickerChart.destroy(); mTickerChart = null; }
+  if (!statusEl || !canvas) return;
+  statusEl.textContent = 'Cargando historial...';
+
+  try {
+    await ensureHistDataLoaded();
+    const dates = Object.keys(histData).sort();
+    const points = [];
+    dates.forEach(d => {
+      const snap = histData[d];
+      if (!snap) return;
+      const all = [...(snap.local||snap.leyLocal||[]), ...(snap.ny||snap.leyNY||[])];
+      const row = all.find(r => r.ticker === ticker || r.Ticker === ticker);
+      if (!row) return;
+      const tir = parseFloat(row.tir ?? row.TIR);
+      if (!isNaN(tir)) points.push({date: d, tir: tir*100});
+    });
+
+    if (points.length < 2) {
+      statusEl.textContent = points.length===1 ? 'Solo hay 1 día de historial para esta ON todavía.' : 'Sin historial disponible para esta ON todavía.';
+      return;
+    }
+    statusEl.textContent = points.length + ' día(s) — ' + points[0].date + ' → ' + points[points.length-1].date;
+
+    const ctx = canvas.getContext('2d');
+    mTickerChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: points.map(p=>p.date),
+        datasets: [{
+          label: 'TIR',
+          data: points.map(p=>p.tir),
+          borderColor: '#00d4aa',
+          backgroundColor: '#00d4aa33',
+          borderWidth: 2,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+          tension: 0.3,
+          spanGaps: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: c => 'TIR: ' + c.parsed.y.toFixed(2) + '%' } }
+        },
+        scales: {
+          x: { ticks: { color: '#7a9bbf', font: { size: 9 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }, grid: { color: '#1e2d45' } },
+          y: { ticks: { color: '#7a9bbf', font: { size: 10 }, callback: v => v.toFixed(1)+'%' }, grid: { color: '#1e2d45' } }
+        }
+      }
+    });
+  } catch(e) {
+    statusEl.textContent = 'No se pudo cargar el historial.';
+  }
 }
 
 // ── THEME ─────────────────────────────────────────────────────────────────────
